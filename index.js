@@ -436,45 +436,128 @@ bot.onText(/\/add/, (msg) => {
 });
 
 bot.on('callback_query', async (query) => {
-  const [action, data] = query.data.split(':');
+  const data = query.data;
+  if (data === 'cancel') {
+    bot.answerCallbackQuery(query.id, { text: 'Отменено' });
+    bot.deleteMessage(query.message.chat.id, query.message.message_id).catch(() => {});
+    return;
+  }
+  const [action, ...rest] = data.split(':');
+  const eventStr = rest.join(':');
   if (action === 'add_event') {
-    const event = JSON.parse(data);
+    const event = JSON.parse(eventStr);
     const userId = String(query.from.id);
-    // Add to today's schedule
     const { data: sched } = await supabase.from('schedules').select('schedule_data').eq('user_id', userId).single();
     const schedule = sched?.schedule_data || {};
-    const today = new Date().getDay(); const dayIdx = today === 0 ? 6 : today - 1;
+    const today = new Date().getDay();
+    const dayIdx = today === 0 ? 6 : today - 1;
     if (!schedule[dayIdx]) schedule[dayIdx] = [];
-    schedule[dayIdx].push({ id: crypto.randomBytes(4).toString('hex'), title: event.title, cat: 'c-conf', start: parseInt(event.startTime) || 9, end: parseInt(event.endTime) || 10, note: event.note || '', urgent: false, done: false, steps: [] });
-    await supabase.from('schedules').upsert({ user_id: userId, schedule_data: schedule, updated_at: new Date().toISOString() });
+    schedule[dayIdx].push({
+      id: crypto.randomBytes(4).toString('hex'),
+      title: event.title,
+      cat: event.cat || 'c-adm',
+      start: event.start || 9,
+      end: event.end || 10,
+      note: event.note || '',
+      noTime: event.noTime || false,
+      urgent: false,
+      done: false,
+      steps: []
+    });
+    await supabase.from('schedules').upsert({
+      user_id: userId,
+      schedule_data: schedule,
+      updated_at: new Date().toISOString()
+    });
     bot.answerCallbackQuery(query.id, { text: '✅ Добавлено в планер!' });
-    bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: query.message.chat.id, message_id: query.message.message_id });
+    bot.editMessageText(
+      `✅ Добавлено в планер!\n\n📝 *${event.title}*${event.noTime ? '\n⏰ Без конкретного времени' : `\n⏰ ${event.start}:00–${event.end}:00`}`,
+      { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: 'Markdown' }
+    ).catch(() => {});
   }
 });
 
 // Handle free-form text as task
 bot.on('message', async (msg) => {
-  if (msg.text && !msg.text.startsWith('/')) {
-    const userId = String(msg.from.id);
-    // Use Claude to parse the message
-    const parsed = await parseTaskMessage(msg.text);
-    if (parsed) {
-      const kb = { inline_keyboard: [[{ text: `✅ Добавить: ${parsed.title} в ${parsed.start}:00`, callback_data: `add_event:${JSON.stringify(parsed).slice(0,200)}` }, { text: '❌ Отмена', callback_data: 'cancel' }]] };
-      bot.sendMessage(msg.chat.id, `Понял! Хотите добавить:\n*${parsed.title}*\n${parsed.start}:00–${parsed.end}:00\n${parsed.note ? '_' + parsed.note + '_' : ''}`, { parse_mode: 'Markdown', reply_markup: kb });
-    }
+  if (!msg.text || msg.text.startsWith('/')) return;
+  const userId = String(msg.from.id);
+  const chatId = msg.chat.id;
+
+  // Show typing indicator
+  bot.sendChatAction(chatId, 'typing');
+
+  const parsed = await parseTaskMessage(msg.text);
+  if (!parsed) {
+    bot.sendMessage(chatId, 'Не смог распознать задачу. Попробуйте написать иначе, например:\n\n«Встреча с коллегой завтра в 14:00»\n«Позвонить пациенту Иванову»\n«Конференция 15 июня в 10 утра до 12»');
+    return;
   }
+
+  // Format display time
+  const timeStr = parsed.noTime
+    ? 'без конкретного времени'
+    : `${parsed.start}:00–${parsed.end}:00`;
+
+  const catNames = {
+    'c-med': '🏥 Пациенты',
+    'c-conf': '📊 Конференции',
+    'c-trav': '✈️ Поездки',
+    'c-adm': '📋 Административное',
+    'c-pers': '🙋 Личное'
+  };
+
+  const preview = `📝 *${parsed.title}*\n⏰ ${timeStr}\n📁 ${catNames[parsed.cat] || 'Другое'}${parsed.note ? '\n📎 _' + parsed.note + '_' : ''}`;
+
+  const eventData = JSON.stringify(parsed).slice(0, 200);
+  const kb = {
+    inline_keyboard: [[
+      { text: '✅ Добавить в планер', callback_data: `add_event:${eventData}` },
+      { text: '❌ Отмена', callback_data: 'cancel' }
+    ]]
+  };
+
+  bot.sendMessage(chatId, `Понял! Добавить в планер?\n\n${preview}`, {
+    parse_mode: 'Markdown',
+    reply_markup: kb
+  });
 });
 
 async function parseTaskMessage(text) {
-  const prompt = `Извлеки задачу из сообщения и верни JSON без markdown:
-{"title":"название","start":9,"end":10,"cat":"c-med|c-conf|c-trav|c-adm|c-pers","note":""}
-Часы — числа (9 = 9:00). Если пациент — cat=c-med, note = "ФИО код диагноз операция".
-Сообщение: "${text}"`;
-  try {
-    const r = await claude.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 200, messages: [{ role: 'user', content: prompt }] });
-    return JSON.parse(r.content[0].text.replace(/```json|```/g,'').trim());
-  } catch { return null; }
+  const prompt = `Извлеки задачу из сообщения пользователя и верни ТОЛЬКО JSON без markdown и пояснений.
+
+Формат ответа:
+{
+  "title": "краткое название задачи",
+  "start": 9,
+  "end": 10,
+  "noTime": false,
+  "cat": "c-med",
+  "note": ""
 }
+
+Правила:
+- title: короткое и чёткое название
+- start, end: целые числа от 6 до 23 (часы). Если "в 9 утра" — start=9, end=10. Если "с 10 до 12" — start=10, end=12
+- noTime: true если время НЕ указано вообще. Тогда start=9, end=10 (значения по умолчанию)
+- cat: выбери одно из: c-med (пациент/операция/медицина), c-conf (конференция/совещание/встреча), c-trav (поездка/командировка/перелёт), c-adm (административное/отчёт/документы), c-pers (личное/спорт/отдых/семья)
+- note: если пациент — "ФИО код диагноз операция". Иначе краткое уточнение или пусто
+- Если упоминается "завтра" — это обычная задача, просто добавь в планер
+
+Сообщение: "${text}"`;
+
+  try {
+    const r = await claude.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    const clean = r.content[0].text.replace(/```json|```/g, '').trim();
+    return JSON.parse(clean);
+  } catch (e) {
+    console.error('parseTaskMessage error:', e.message);
+    return null;
+  }
+}
+
 
 // ─── Morning briefing cron ─────────────────────────────────
 cron.schedule('30 7 * * *', async () => {

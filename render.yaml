@@ -1,0 +1,43 @@
+# ══════════════════════════════════════════════════
+#  МедПланер — Конфиг деплоя для Render.com
+#  Положите этот файл в корень папки server/
+# ══════════════════════════════════════════════════
+
+services:
+  - type: web
+    name: medplaner-server
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free          # Бесплатный тариф
+    autoDeploy: true    # Автодеплой при пуше в GitHub
+
+    # Переменные окружения — заполните в панели Render
+    # Render → ваш сервис → Environment → Add Environment Variable
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false       # Заполнить вручную в Render
+      - key: MINIAPP_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: YANDEX_CLIENT_ID
+        sync: false
+      - key: YANDEX_CLIENT_SECRET
+        sync: false
+      - key: ENCRYPT_KEY
+        sync: false
+      - key: APP_URL
+        sync: false
+      - key: ALLOWED_ORIGIN
+        sync: false

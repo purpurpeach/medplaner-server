@@ -13,7 +13,7 @@ const { google } = require('googleapis');
 const TelegramBot = require('node-telegram-bot-api');
 const cron = require('node-cron');
 const crypto = require('crypto');
-const ical = require('ical-generator');
+const icalGenerator = require('ical-generator');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -23,17 +23,47 @@ app.use(express.json({ limit: '20mb' }));
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 
 // ─── Clients ───────────────────────────────────────────────
+const requiredEnv = ['TELEGRAM_BOT_TOKEN', 'SUPABASE_URL', 'SUPABASE_SERVICE_KEY'];
+const missingEnv = requiredEnv.filter((key) => !process.env[key]);
+if (missingEnv.length) {
+  console.warn(`Missing required environment variables: ${missingEnv.join(', ')}`);
+}
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
+const botMode = process.env.BOT_MODE || (process.env.NODE_ENV === 'production' ? 'webhook' : 'polling');
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false });
+const pendingEvents = new Map();
+const ical = icalGenerator.default || icalGenerator;
+
+function miniAppUrl() {
+  return process.env.MINIAPP_URL || process.env.APP_URL || 'https://example.com';
+}
+
+function rememberEvent(event) {
+  const id = crypto.randomBytes(8).toString('hex');
+  pendingEvents.set(id, event);
+  setTimeout(() => pendingEvents.delete(id), 30 * 60 * 1000).unref?.();
+  return id;
+}
+
+function addEventKeyboard(event, text = '✅ Добавить') {
+  return [[
+    { text, callback_data: `add:${rememberEvent(event)}` },
+    { text: '❌ Отмена', callback_data: 'cancel' }
+  ]];
+}
 
 // ─── Encryption ────────────────────────────────────────────
-const ENCRYPT_KEY = Buffer.from(
-  (process.env.ENCRYPT_KEY || 'default_key_change_me_please!!').slice(0, 32)
-);
+const ENCRYPT_KEY = crypto
+  .createHash('sha256')
+  .update(process.env.ENCRYPT_KEY || 'default_key_change_me_please')
+  .digest();
 
 function encrypt(text) {
   const iv = crypto.randomBytes(16);
@@ -145,6 +175,9 @@ app.post('/api/evening-summary', validateTelegramUser, async (req, res) => {
 });
 
 async function generateEveSummary({ easy, hard, win, energy }) {
+  if (!openai) {
+    return 'Хороший день! Отдохните и подготовьтесь к завтрашнему.';
+  }
   const prompt = `Составь краткое вечернее резюме дня для врача (3-4 предложения), на русском.
 Что далось легко: ${easy || 'не указано'}
 Что было сложно: ${hard || 'не указано'}
@@ -250,6 +283,17 @@ async function addEventToSchedule(userId, event) {
 
 // Разобрать текстовое сообщение
 async function parseTextMessage(text) {
+  if (!openai) {
+    return {
+      type: 'task',
+      title: text.slice(0, 80),
+      start: 9,
+      end: 10,
+      noTime: true,
+      cat: 'c-adm',
+      note: ''
+    };
+  }
   const prompt = `Ты помощник врача-планировщика. Разбери сообщение и верни JSON без markdown.
 
 Формат:
@@ -290,6 +334,9 @@ async function parseTextMessage(text) {
 
 // Разобрать изображение (билет, направление, документ)
 async function parseImageMessage(imageUrl) {
+  if (!openai) {
+    return null;
+  }
   const prompt = `Ты помощник врача-планировщика. Посмотри на изображение и извлеки информацию для планера.
 
 Верни JSON без markdown:
@@ -330,6 +377,9 @@ async function parseImageMessage(imageUrl) {
 
 // Расшифровать голосовое сообщение
 async function transcribeVoice(fileUrl) {
+  if (!openai) {
+    return null;
+  }
   try {
     // Скачиваем файл
     const tmpPath = `/tmp/voice_${Date.now()}.ogg`;
@@ -376,7 +426,7 @@ bot.onText(/\/start/, async (msg) => {
       parse_mode: 'Markdown',
       reply_markup: {
         inline_keyboard: [[
-          { text: '📅 Открыть планер', web_app: { url: process.env.MINIAPP_URL } }
+          { text: '📅 Открыть планер', web_app: { url: miniAppUrl() } }
         ]]
       }
     }
@@ -407,14 +457,14 @@ bot.onText(/\/today/, async (msg) => {
     `📅 *План на сегодня:*\n\n${lines}`,
     {
       parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: [[{ text: '📅 Открыть планер', web_app: { url: process.env.MINIAPP_URL } }]] }
+      reply_markup: { inline_keyboard: [[{ text: '📅 Открыть планер', web_app: { url: miniAppUrl() } }]] }
     }
   );
 });
 
 bot.onText(/\/planner/, (msg) => {
   bot.sendMessage(msg.chat.id, '📅 Открываю планер:', {
-    reply_markup: { inline_keyboard: [[{ text: '📅 МедПланер', web_app: { url: process.env.MINIAPP_URL } }]] }
+    reply_markup: { inline_keyboard: [[{ text: '📅 МедПланер', web_app: { url: miniAppUrl() } }]] }
   });
 });
 
@@ -494,8 +544,7 @@ bot.on('message', async (msg) => {
       parse_mode: 'Markdown',
       reply_markup: {
         inline_keyboard: [[
-          { text: '✅ Добавить в планер', callback_data: `add:${JSON.stringify(parsed).slice(0,230)}` },
-          { text: '❌ Отмена', callback_data: 'cancel' }
+          ...addEventKeyboard(parsed, '✅ Добавить в планер')[0]
         ]]
       }
     });
@@ -530,8 +579,7 @@ async function handleTextTask(chatId, userId, text) {
     parse_mode: 'Markdown',
     reply_markup: {
       inline_keyboard: [[
-        { text: '✅ Добавить', callback_data: `add:${JSON.stringify(parsed).slice(0,230)}` },
-        { text: '❌ Отмена', callback_data: 'cancel' }
+        ...addEventKeyboard(parsed, '✅ Добавить')[0]
       ]]
     }
   });
@@ -550,16 +598,21 @@ bot.on('callback_query', async (query) => {
   }
 
   if (data.startsWith('add:')) {
-    const eventStr = data.slice(4);
+    const eventId = data.slice(4);
     try {
-      const event = JSON.parse(eventStr);
+      const event = pendingEvents.get(eventId);
+      if (!event) {
+        bot.answerCallbackQuery(query.id, { text: 'Событие устарело. Отправьте задачу ещё раз.' });
+        return;
+      }
+      pendingEvents.delete(eventId);
       await addEventToSchedule(userId, event);
       bot.answerCallbackQuery(query.id, { text: '✅ Добавлено!' });
       const timeStr = event.noTime ? 'без времени' : `${event.start}:00–${event.end}:00`;
       bot.editMessageText(
         `✅ *Добавлено в планер!*\n\n📝 ${event.title}\n⏰ ${timeStr}`,
         { chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown',
-          reply_markup: { inline_keyboard: [[{ text: '📅 Открыть планер', web_app: { url: process.env.MINIAPP_URL } }]] } }
+          reply_markup: { inline_keyboard: [[{ text: '📅 Открыть планер', web_app: { url: miniAppUrl() } }]] } }
       ); // handled
     } catch (e) {
       bot.answerCallbackQuery(query.id, { text: 'Ошибка, попробуйте снова' });
@@ -581,7 +634,7 @@ cron.schedule('30 7 * * *', async () => {
     bot.sendMessage(user.telegram_id,
       `🌅 *Доброе утро!*\n\nСегодня у вас ${blocks.length} задач:\n\n${lines}\n\n_Удачного дня!_`,
       { parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [[{ text: '📅 Открыть планер', web_app: { url: process.env.MINIAPP_URL } }]] } }
+        reply_markup: { inline_keyboard: [[{ text: '📅 Открыть планер', web_app: { url: miniAppUrl() } }]] } }
     ); // handled
   }
 }, { timezone: 'Europe/Moscow' });
@@ -591,7 +644,7 @@ cron.schedule('0 20 * * *', async () => {
   const { data: users } = await supabase.from('users').select('*');
   for (const user of (users || [])) {
     bot.sendMessage(user.telegram_id, '🌙 Как прошёл день? Давайте подведём итоги.', {
-      reply_markup: { inline_keyboard: [[{ text: '📝 Вечерняя планёрка', web_app: { url: process.env.MINIAPP_URL + '?eve=1' } }]] }
+      reply_markup: { inline_keyboard: [[{ text: '📝 Вечерняя планёрка', web_app: { url: miniAppUrl() + '?eve=1' } }]] }
     }); // handled
   }
 }, { timezone: 'Europe/Moscow' });
@@ -599,5 +652,34 @@ cron.schedule('0 20 * * *', async () => {
 // ─── Health check ───────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
+app.post('/telegram/webhook', (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`МедПланер сервер запущен на порту ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`МедПланер сервер запущен на порту ${PORT}`);
+
+  try {
+    if (botMode === 'disabled') {
+      console.log('Telegram bot disabled by BOT_MODE=disabled');
+    } else if (botMode === 'webhook') {
+      const baseUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL;
+      if (!baseUrl) {
+        console.warn('APP_URL/RENDER_EXTERNAL_URL не задан. Webhook Telegram не установлен.');
+        return;
+      }
+      const webhookUrl = `${baseUrl.replace(/\/$/, '')}/telegram/webhook`;
+      await bot.stopPolling();
+      await bot.setWebHook(webhookUrl);
+      console.log(`Telegram webhook установлен: ${webhookUrl}`);
+    } else {
+      await bot.deleteWebHook({ drop_pending_updates: true });
+      await bot.startPolling({ restart: true });
+      console.log('Telegram bot запущен в polling mode');
+    }
+  } catch (error) {
+    console.error('Telegram startup error:', error.message);
+  }
+});

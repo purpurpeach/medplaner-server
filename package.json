@@ -1,14 +1,14 @@
 {
   "name": "medplaner-server",
   "version": "1.0.0",
-  "description": "МедПланер — Backend сервер",
+  "description": "MedPlaner Telegram Mini App backend",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "check": "node --check index.js"
   },
   "dependencies": {
-    "openai": "^4.52.0",
     "@supabase/supabase-js": "^2.45.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
@@ -16,7 +16,8 @@
     "googleapis": "^144.0.0",
     "ical-generator": "^7.1.0",
     "node-cron": "^3.0.3",
-    "node-telegram-bot-api": "^0.66.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "openai": "^4.52.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"

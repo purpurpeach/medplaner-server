@@ -618,20 +618,22 @@ body {
 
   <div class="settings-section">
     <div class="ss-title"><i class="ti ti-calendar"></i> Google Calendar</div>
-    <div class="ss-sub">Двусторонняя синхронизация с Google Calendar.</div>
+    <div class="ss-sub">Подписка Google Calendar на актуальный планер по постоянной .ics-ссылке.</div>
+    <div class="ical-box" id="icalUrl">Загрузка ссылки…</div>
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
-      <button class="connect-btn" id="gcalBtn" onclick="connectGCal()"><i class="ti ti-login"></i> Войти через Google</button>
-      <span class="ss-badge bg-gray" id="gcalStatus">Не подключён</span>
+      <button class="connect-btn" onclick="copyICal()"><i class="ti ti-copy"></i> Скопировать .ics</button>
+      <button class="connect-btn" id="gcalBtn" onclick="connectGCal()"><i class="ti ti-calendar-plus"></i> Открыть Google</button>
+      <span class="ss-badge bg-gray" id="gcalStatus">Подписка</span>
     </div>
     <div style="margin-top:8px;">
-      <div class="fl">Добавить события в Apple Calendar:</div>
+      <div class="fl">Как подключить в Google Calendar:</div>
       <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:12px;color:var(--text2);margin-bottom:8px;line-height:1.6;">
-        1. Нажмите «Скачать .ics файл» ниже<br>
-        2. Откройте скачанный файл<br>
-        3. iPhone предложит добавить в Календарь → нажмите «Добавить»
+        1. Скопируйте .ics-ссылку выше<br>
+        2. Откройте Google Calendar → Другие календари → По URL<br>
+        3. Вставьте ссылку и нажмите «Добавить календарь»
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <button class="connect-btn" onclick="exportICS()"><i class="ti ti-calendar-plus"></i> Скачать .ics файл</button>
+        <button class="connect-btn" onclick="exportICS()"><i class="ti ti-download"></i> Скачать разовый .ics файл</button>
       </div>
     </div>
   </div>
@@ -769,6 +771,7 @@ if (tg) {
 }
 const TG_USER_ID = tg?.initDataUnsafe?.user?.id || 'demo';
 const API_BASE = window.APP_CONFIG?.apiBase || 'https://medplaner-server.onrender.com/api';
+const SERVER_BASE = API_BASE.replace(/\/api\/?$/, '');
 
 // ─── State ───
 const HOURS = []; for (let h = 6; h <= 23; h++) HOURS.push(h);
@@ -1338,9 +1341,25 @@ async function addEventFromMail(mailId) {
 function connectGmail() { window.open(API_BASE + '/auth/gmail?userId=' + TG_USER_ID, '_blank'); document.getElementById('gmailStatus').textContent = 'Ожидание…'; document.getElementById('gmailStatus').className = 'ss-badge bg-warn'; setTimeout(() => { document.getElementById('gmailStatus').textContent = 'Подключён'; document.getElementById('gmailStatus').className = 'ss-badge bg-green'; document.getElementById('gmailBtn').textContent = '✓ Подключён'; document.getElementById('gmailBtn').className = 'connect-btn connected'; }, 3000); }
 function connectYandex() { window.open(API_BASE + '/auth/yandex?userId=' + TG_USER_ID, '_blank'); document.getElementById('yandexStatus').textContent = 'Ожидание…'; document.getElementById('yandexStatus').className = 'ss-badge bg-warn'; setTimeout(() => { document.getElementById('yandexStatus').textContent = 'Подключён'; document.getElementById('yandexStatus').className = 'ss-badge bg-green'; document.getElementById('yandexBtn').textContent = '✓ Подключён'; document.getElementById('yandexBtn').className = 'connect-btn connected'; }, 3000); }
 function connectApple() { document.getElementById('appleStatus').textContent = 'Подключён'; document.getElementById('appleStatus').className = 'ss-badge bg-green'; document.getElementById('appleBtn').textContent = '✓ Подключён'; document.getElementById('appleBtn').className = 'connect-btn connected'; toast('Apple Calendar подключён!'); }
-function connectGCal() { window.open(API_BASE + '/auth/gcal?userId=' + TG_USER_ID, '_blank'); document.getElementById('gcalStatus').textContent = 'Подключён'; document.getElementById('gcalStatus').className = 'ss-badge bg-green'; document.getElementById('gcalBtn').textContent = '✓ Подключён'; document.getElementById('gcalBtn').className = 'connect-btn connected'; }
+function connectGCal() {
+  window.open('https://calendar.google.com/calendar/u/0/r/settings/addbyurl', '_blank');
+  document.getElementById('gcalStatus').textContent = 'Скопируйте ссылку';
+  document.getElementById('gcalStatus').className = 'ss-badge bg-warn';
+}
 function connectTodoist() { window.open(API_BASE + '/auth/todoist?userId=' + TG_USER_ID, '_blank'); document.getElementById('todoistStatus').textContent = 'Подключён'; document.getElementById('todoistStatus').className = 'ss-badge bg-green'; document.getElementById('todoistBtn').textContent = '✓ Подключён'; document.getElementById('todoistBtn').className = 'connect-btn connected'; }
-function copyICal() { const url = document.getElementById('icalUrl').textContent; if (navigator.clipboard) { navigator.clipboard.writeText(url).then(() => toast('Ссылка скопирована!')); } }
+function subscriptionUrl() {
+  return `${SERVER_BASE}/ical/${TG_USER_ID}.ics`;
+}
+function copyICal() {
+  const url = subscriptionUrl();
+  const el = document.getElementById('icalUrl');
+  if (el) el.textContent = url;
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(url).then(() => toast('Ссылка скопирована!'));
+  } else {
+    toast('Скопируйте ссылку вручную');
+  }
+}
 function exportICS() {
   const today = new Date();
   const lines = [
@@ -1412,9 +1431,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadData();
     renderGrid(); renderCats(); updateBalance();
     const icalUrl = document.getElementById('icalUrl');
-    if (icalUrl) {
-      icalUrl.textContent = `https://medplaner-server.onrender.com/ical/${TG_USER_ID}.ics`;
-    }
+    if (icalUrl) icalUrl.textContent = subscriptionUrl();
   } catch (error) {
     console.error('Startup error:', error);
     toast('Ошибка запуска. Обновите страницу.');

@@ -13,7 +13,6 @@ const { google } = require('googleapis');
 const TelegramBot = require('node-telegram-bot-api');
 const cron = require('node-cron');
 const crypto = require('crypto');
-const icalGenerator = require('ical-generator');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -39,10 +38,19 @@ const openai = process.env.OPENAI_API_KEY
 const botMode = process.env.BOT_MODE || (process.env.NODE_ENV === 'production' ? 'webhook' : 'polling');
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false });
 const pendingEvents = new Map();
-const ical = icalGenerator.default || icalGenerator;
 
 function miniAppUrl() {
   return process.env.MINIAPP_URL || process.env.APP_URL || 'https://example.com';
+}
+
+function warnMiniAppConfig() {
+  const appUrl = (process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+  const url = (process.env.MINIAPP_URL || '').replace(/\/$/, '');
+  if (!url) {
+    console.warn('MINIAPP_URL не задан. Кнопка в Telegram будет открывать backend, а не Mini App.');
+  } else if (appUrl && url === appUrl) {
+    console.warn('MINIAPP_URL совпадает с APP_URL backend. Укажите URL фронтенда Netlify.');
+  }
 }
 
 function rememberEvent(event) {
@@ -131,31 +139,108 @@ app.post('/api/schedule', validateTelegramUser, async (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── iCal ──────────────────────────────────────────────────
+// ─── iCal subscription ──────────────────────────────────────
+function escapeIcs(value = '') {
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/\n/g, '\\n')
+    .replace(/,/g, '\\,')
+    .replace(/;/g, '\\;');
+}
+
+function pad2(value) {
+  return String(value).padStart(2, '0');
+}
+
+function formatIcsDateTime(date) {
+  return [
+    date.getUTCFullYear(),
+    pad2(date.getUTCMonth() + 1),
+    pad2(date.getUTCDate()),
+    'T',
+    pad2(date.getUTCHours()),
+    pad2(date.getUTCMinutes()),
+    pad2(date.getUTCSeconds()),
+    'Z'
+  ].join('');
+}
+
+function weekStart(date = new Date()) {
+  const result = new Date(date);
+  const day = result.getDay();
+  const diffToMonday = day === 0 ? -6 : 1 - day;
+  result.setHours(0, 0, 0, 0);
+  result.setDate(result.getDate() + diffToMonday);
+  return result;
+}
+
+function addHours(date, hourValue) {
+  const result = new Date(date);
+  const hour = Number(hourValue || 9);
+  const wholeHours = Math.floor(hour);
+  const minutes = Math.round((hour - wholeHours) * 60);
+  result.setHours(wholeHours, minutes, 0, 0);
+  return result;
+}
+
 app.get('/ical/:userId.ics', async (req, res) => {
   const { userId } = req.params;
-  const { data } = await supabase.from('schedules').select('*').eq('user_id', userId).single();
-  const cal = ical({ name: 'МедПланер' });
-  if (data?.schedule_data) {
-    const today = new Date();
-    Object.entries(data.schedule_data).forEach(([dayIdx, blocks]) => {
-      if (!Array.isArray(blocks)) return;
-      blocks.forEach(block => {
-        const date = new Date(today);
-        const dow = today.getDay();
-        const mon = dow === 0 ? -6 : 1 - dow;
-        date.setDate(date.getDate() + mon + parseInt(dayIdx));
-        const start = new Date(date);
-        start.setHours(Math.floor(block.start), (block.start % 1) * 60, 0, 0);
-        const end = new Date(date);
-        end.setHours(Math.floor(block.end), (block.end % 1) * 60, 0, 0);
-        const note = block.note && block.note.includes(':') ? decrypt(block.note) : (block.note || '');
-        cal.createEvent({ start, end, summary: block.title, description: note });
-      });
-    });
+  const { data, error } = await supabase
+    .from('schedules')
+    .select('schedule_data, updated_at')
+    .eq('user_id', userId)
+    .single();
+
+  if (error && error.code !== 'PGRST116') {
+    return res.status(500).send(error.message);
   }
-  res.set('Content-Type', 'text/calendar; charset=utf-8');
-  res.send(cal.toString());
+
+  const lines = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//MedPlaner//Telegram Mini App//RU',
+    'CALSCALE:GREGORIAN',
+    'METHOD:PUBLISH',
+    'X-WR-CALNAME:МедПланер',
+    'X-WR-TIMEZONE:Europe/Moscow',
+    'REFRESH-INTERVAL;VALUE=DURATION:PT1H',
+    'X-PUBLISHED-TTL:PT1H'
+  ];
+
+  const startOfWeek = weekStart();
+  const schedule = data?.schedule_data || {};
+  Object.entries(schedule).forEach(([dayIdx, blocks]) => {
+    if (!Array.isArray(blocks)) return;
+    blocks.forEach((block) => {
+      if (!block?.title) return;
+      const eventDate = new Date(startOfWeek);
+      eventDate.setDate(eventDate.getDate() + Number(dayIdx || 0));
+      const start = addHours(eventDate, block.start);
+      const end = addHours(eventDate, block.end || Number(block.start || 9) + 1);
+      const note = block.note && block.note.includes(':') ? decrypt(block.note) : (block.note || '');
+      const uid = `${userId}-${dayIdx}-${block.id || crypto.createHash('sha1').update(block.title + start.toISOString()).digest('hex')}@medplaner`;
+
+      lines.push('BEGIN:VEVENT');
+      lines.push(`UID:${uid}`);
+      lines.push(`DTSTAMP:${formatIcsDateTime(new Date(data?.updated_at || Date.now()))}`);
+      lines.push(`DTSTART:${formatIcsDateTime(start)}`);
+      lines.push(`DTEND:${formatIcsDateTime(end)}`);
+      lines.push('RRULE:FREQ=WEEKLY;COUNT=52');
+      lines.push(`SUMMARY:${escapeIcs(block.title)}`);
+      if (note) lines.push(`DESCRIPTION:${escapeIcs(note)}`);
+      if (block.done) lines.push('STATUS:COMPLETED');
+      lines.push('END:VEVENT');
+    });
+  });
+
+  lines.push('END:VCALENDAR');
+
+  res.set({
+    'Content-Type': 'text/calendar; charset=utf-8',
+    'Content-Disposition': `inline; filename="medplaner-${userId}.ics"`,
+    'Cache-Control': 'no-cache, no-store, must-revalidate'
+  });
+  res.send(lines.join('\r\n'));
 });
 
 // ─── Evening summary ────────────────────────────────────────
@@ -652,6 +737,14 @@ cron.schedule('0 20 * * *', async () => {
 // ─── Health check ───────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
+app.get('/', (req, res) => {
+  res.type('html').send(`
+    <h1>MedPlaner backend is running</h1>
+    <p>This is the API server, not the Telegram Mini App frontend.</p>
+    <p>Health: <a href="/health">/health</a></p>
+  `);
+});
+
 app.post('/telegram/webhook', (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
@@ -660,6 +753,7 @@ app.post('/telegram/webhook', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`МедПланер сервер запущен на порту ${PORT}`);
+  warnMiniAppConfig();
 
   try {
     if (botMode === 'disabled') {

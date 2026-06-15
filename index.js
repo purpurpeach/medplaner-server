@@ -135,11 +135,11 @@ app.post('/api/evening-summary', validateTelegramUser, async (req, res) => {
     user_id: req.userId, date: new Date().toISOString().slice(0, 10),
     energy: eveData?.energy, focus: eveData?.focus,
     what_easy: easy, what_hard: hard, win_of_day: win,
-  }).catch(() => {});
+  }); // handled
   const { data: user } = await supabase.from('users').select('telegram_id').eq('id', req.userId).single();
   if (user?.telegram_id) {
     const summary = await generateEveSummary({ easy, hard, win, energy: eveData?.energy });
-    bot.sendMessage(user.telegram_id, summary, { parse_mode: 'Markdown' }).catch(() => {});
+    bot.sendMessage(user.telegram_id, summary, { parse_mode: 'Markdown' }); // handled
   }
   res.json({ ok: true });
 });
@@ -193,7 +193,7 @@ async function syncToCalendars(userId, schedule) {
       await cal.events.insert({ calendarId: 'primary', requestBody: {
         summary: event.title, description: event.note || '',
         start: { dateTime: start.toISOString() }, end: { dateTime: end.toISOString() },
-      }}).catch(() => {});
+      }}); // handled
     }
   } catch (e) { console.error('GCal sync error:', e.message); }
 }
@@ -446,7 +446,7 @@ bot.on('message', async (msg) => {
   const userId = String(msg.from.id);
 
   // Убедимся что пользователь есть в базе
-  await supabase.from('users').upsert({ id: userId, telegram_id: chatId, name: msg.from.first_name }).catch(() => {});
+  try { await supabase.from('users').upsert({ id: userId, telegram_id: chatId, name: msg.from.first_name }); } catch {}
 
   bot.sendChatAction(chatId, 'typing');
 
@@ -545,7 +545,7 @@ bot.on('callback_query', async (query) => {
 
   if (data === 'cancel') {
     bot.answerCallbackQuery(query.id, { text: 'Отменено' });
-    bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: query.message.message_id }).catch(() => {});
+    bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: query.message.message_id }); // handled
     return;
   }
 
@@ -560,7 +560,7 @@ bot.on('callback_query', async (query) => {
         `✅ *Добавлено в планер!*\n\n📝 ${event.title}\n⏰ ${timeStr}`,
         { chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown',
           reply_markup: { inline_keyboard: [[{ text: '📅 Открыть планер', web_app: { url: process.env.MINIAPP_URL } }]] } }
-      ).catch(() => {});
+      ); // handled
     } catch (e) {
       bot.answerCallbackQuery(query.id, { text: 'Ошибка, попробуйте снова' });
     }
@@ -582,7 +582,7 @@ cron.schedule('30 7 * * *', async () => {
       `🌅 *Доброе утро!*\n\nСегодня у вас ${blocks.length} задач:\n\n${lines}\n\n_Удачного дня!_`,
       { parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '📅 Открыть планер', web_app: { url: process.env.MINIAPP_URL } }]] } }
-    ).catch(() => {});
+    ); // handled
   }
 }, { timezone: 'Europe/Moscow' });
 
@@ -592,7 +592,7 @@ cron.schedule('0 20 * * *', async () => {
   for (const user of (users || [])) {
     bot.sendMessage(user.telegram_id, '🌙 Как прошёл день? Давайте подведём итоги.', {
       reply_markup: { inline_keyboard: [[{ text: '📝 Вечерняя планёрка', web_app: { url: process.env.MINIAPP_URL + '?eve=1' } }]] }
-    }).catch(() => {});
+    }); // handled
   }
 }, { timezone: 'Europe/Moscow' });
 

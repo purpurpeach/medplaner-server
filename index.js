@@ -124,6 +124,11 @@ app.get('/api/schedule', validateTelegramUser, async (req, res) => {
 
 app.post('/api/schedule', validateTelegramUser, async (req, res) => {
   const { schedule, categories } = req.body;
+  // Убедимся что пользователь существует (иначе foreign key падает)
+  try {
+    await supabase.from('users').upsert({ id: req.userId }, { onConflict: 'id' });
+  } catch (e) { console.error('user upsert:', e.message); }
+
   const encSchedule = JSON.parse(JSON.stringify(schedule));
   Object.values(encSchedule).forEach(day => {
     if (Array.isArray(day)) day.forEach(block => {
@@ -134,7 +139,7 @@ app.post('/api/schedule', validateTelegramUser, async (req, res) => {
     user_id: req.userId, schedule_data: encSchedule,
     categories, updated_at: new Date().toISOString()
   });
-  if (error) return res.status(500).json({ error: error.message });
+  if (error) { console.error('schedule save error:', error.message); return res.status(500).json({ error: error.message }); }
   syncToCalendars(req.userId, schedule).catch(console.error);
   res.json({ ok: true });
 });
@@ -345,11 +350,13 @@ async function getOAuthTokens(userId) {
 
 // Добавить событие в расписание пользователя
 async function addEventToSchedule(userId, event) {
+  // Гарантируем что пользователь существует (foreign key)
+  try { await supabase.from('users').upsert({ id: userId }, { onConflict: 'id' }); } catch {}
   const { data: sched } = await supabase.from('schedules').select('schedule_data').eq('user_id', userId).single();
   const schedule = sched?.schedule_data || {};
   const today = new Date().getDay();
-  const dayIdx = today === 0 ? 6 : today - 1;
-  if (!schedule[dayIdx]) schedule[dayIdx] = [];
+  const dayIdx = String(today === 0 ? 6 : today - 1);
+  if (!Array.isArray(schedule[dayIdx])) schedule[dayIdx] = [];
   schedule[dayIdx].push({
     id: crypto.randomBytes(4).toString('hex'),
     title: event.title,
@@ -360,9 +367,10 @@ async function addEventToSchedule(userId, event) {
     noTime: event.noTime || false,
     urgent: false, done: false, steps: []
   });
-  await supabase.from('schedules').upsert({
+  const { error } = await supabase.from('schedules').upsert({
     user_id: userId, schedule_data: schedule, updated_at: new Date().toISOString()
   });
+  if (error) { console.error('addEvent save error:', error.message); throw error; }
   return schedule;
 }
 

@@ -124,11 +124,6 @@ app.get('/api/schedule', validateTelegramUser, async (req, res) => {
 
 app.post('/api/schedule', validateTelegramUser, async (req, res) => {
   const { schedule, categories } = req.body;
-  // Убедимся что пользователь существует (иначе foreign key падает)
-  try {
-    await supabase.from('users').upsert({ id: req.userId }, { onConflict: 'id' });
-  } catch (e) { console.error('user upsert:', e.message); }
-
   const encSchedule = JSON.parse(JSON.stringify(schedule));
   Object.values(encSchedule).forEach(day => {
     if (Array.isArray(day)) day.forEach(block => {
@@ -139,7 +134,7 @@ app.post('/api/schedule', validateTelegramUser, async (req, res) => {
     user_id: req.userId, schedule_data: encSchedule,
     categories, updated_at: new Date().toISOString()
   });
-  if (error) { console.error('schedule save error:', error.message); return res.status(500).json({ error: error.message }); }
+  if (error) return res.status(500).json({ error: error.message });
   syncToCalendars(req.userId, schedule).catch(console.error);
   res.json({ ok: true });
 });
@@ -170,12 +165,26 @@ function formatIcsDateTime(date) {
   ].join('');
 }
 
+// Время в планере уже московское настенное (9:00 = 9 утра МСК).
+// Выводим как есть, с пометкой TZID=Europe/Moscow — без сдвигов.
+function formatIcsLocal(date) {
+  return [
+    date.getUTCFullYear(),
+    pad2(date.getUTCMonth() + 1),
+    pad2(date.getUTCDate()),
+    'T',
+    pad2(date.getUTCHours()),
+    pad2(date.getUTCMinutes()),
+    '00'
+  ].join('');
+}
+
 function weekStart(date = new Date()) {
   const result = new Date(date);
-  const day = result.getDay();
+  const day = result.getUTCDay();
   const diffToMonday = day === 0 ? -6 : 1 - day;
-  result.setHours(0, 0, 0, 0);
-  result.setDate(result.getDate() + diffToMonday);
+  result.setUTCHours(0, 0, 0, 0);
+  result.setUTCDate(result.getUTCDate() + diffToMonday);
   return result;
 }
 
@@ -184,7 +193,7 @@ function addHours(date, hourValue) {
   const hour = Number(hourValue || 9);
   const wholeHours = Math.floor(hour);
   const minutes = Math.round((hour - wholeHours) * 60);
-  result.setHours(wholeHours, minutes, 0, 0);
+  result.setUTCHours(wholeHours, minutes, 0, 0);
   return result;
 }
 
@@ -214,23 +223,29 @@ app.get('/ical/:userId.ics', async (req, res) => {
 
   const startOfWeek = weekStart();
   const schedule = data?.schedule_data || {};
-  Object.entries(schedule).forEach(([dayIdx, blocks]) => {
+  Object.entries(schedule).forEach(([dayKey, blocks]) => {
     if (!Array.isArray(blocks)) return;
     blocks.forEach((block) => {
       if (!block?.title) return;
-      const eventDate = new Date(startOfWeek);
-      eventDate.setDate(eventDate.getDate() + Number(dayIdx || 0));
+      // Ключ может быть датой YYYY-MM-DD или старым числом 0-6
+      let eventDate;
+      if (/^\d{4}-\d{2}-\d{2}$/.test(dayKey)) {
+        const [y, m, d] = dayKey.split('-').map(Number);
+        eventDate = new Date(Date.UTC(y, m - 1, d, 0, 0, 0));
+      } else {
+        eventDate = new Date(startOfWeek);
+        eventDate.setUTCDate(eventDate.getUTCDate() + Number(dayKey || 0));
+      }
       const start = addHours(eventDate, block.start);
       const end = addHours(eventDate, block.end || Number(block.start || 9) + 1);
       const note = block.note && block.note.includes(':') ? decrypt(block.note) : (block.note || '');
-      const uid = `${userId}-${dayIdx}-${block.id || crypto.createHash('sha1').update(block.title + start.toISOString()).digest('hex')}@medplaner`;
+      const uid = `${userId}-${dayKey}-${block.id || crypto.createHash('sha1').update(block.title + start.toISOString()).digest('hex')}@medplaner`;
 
       lines.push('BEGIN:VEVENT');
       lines.push(`UID:${uid}`);
       lines.push(`DTSTAMP:${formatIcsDateTime(new Date(data?.updated_at || Date.now()))}`);
-      lines.push(`DTSTART:${formatIcsDateTime(start)}`);
-      lines.push(`DTEND:${formatIcsDateTime(end)}`);
-      lines.push('RRULE:FREQ=WEEKLY;COUNT=52');
+      lines.push(`DTSTART;TZID=Europe/Moscow:${formatIcsLocal(start)}`);
+      lines.push(`DTEND;TZID=Europe/Moscow:${formatIcsLocal(end)}`);
       lines.push(`SUMMARY:${escapeIcs(block.title)}`);
       if (note) lines.push(`DESCRIPTION:${escapeIcs(note)}`);
       if (block.done) lines.push('STATUS:COMPLETED');
@@ -349,15 +364,20 @@ async function getOAuthTokens(userId) {
 // ─── AI helpers ─────────────────────────────────────────────
 
 // Добавить событие в расписание пользователя
+function todayDateKey(offsetDays = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
 async function addEventToSchedule(userId, event) {
-  // Гарантируем что пользователь существует (foreign key)
   try { await supabase.from('users').upsert({ id: userId }, { onConflict: 'id' }); } catch {}
   const { data: sched } = await supabase.from('schedules').select('schedule_data').eq('user_id', userId).single();
   const schedule = sched?.schedule_data || {};
-  const today = new Date().getDay();
-  const dayIdx = String(today === 0 ? 6 : today - 1);
-  if (!Array.isArray(schedule[dayIdx])) schedule[dayIdx] = [];
-  schedule[dayIdx].push({
+  // Ключ даты: либо из event.date (YYYY-MM-DD), либо сегодня
+  let key = event.date && /^\d{4}-\d{2}-\d{2}$/.test(event.date) ? event.date : todayDateKey();
+  if (!Array.isArray(schedule[key])) schedule[key] = [];
+  schedule[key].push({
     id: crypto.randomBytes(4).toString('hex'),
     title: event.title,
     cat: event.cat || 'c-adm',
@@ -533,9 +553,10 @@ bot.onText(/\/today/, async (msg) => {
     bot.sendMessage(msg.chat.id, '📅 Расписание пока пустое. Добавьте задачи!');
     return;
   }
+  const dKey = todayDateKey();
   const today = new Date().getDay();
-  const dayIdx = today === 0 ? 6 : today - 1;
-  const blocks = data.schedule_data[String(dayIdx)] || [];
+  const legacyIdx = String(today === 0 ? 6 : today - 1);
+  const blocks = data.schedule_data[dKey] || data.schedule_data[legacyIdx] || [];
   if (!blocks.length) {
     bot.sendMessage(msg.chat.id, '📅 Сегодня задач нет. Хороший день для отдыха!');
     return;
@@ -720,8 +741,9 @@ cron.schedule('30 7 * * *', async () => {
     const { data: sched } = await supabase.from('schedules').select('schedule_data').eq('user_id', user.id).single();
     if (!sched?.schedule_data) continue;
     const today = new Date().getDay();
-    const dayIdx = today === 0 ? 6 : today - 1;
-    const blocks = sched.schedule_data[String(dayIdx)] || [];
+    const dKey = todayDateKey();
+    const legacyIdx = String(today === 0 ? 6 : today - 1);
+    const blocks = sched.schedule_data[dKey] || sched.schedule_data[legacyIdx] || [];
     if (!blocks.length) continue;
     const lines = blocks.map(b => `• ${b.noTime ? 'без времени' : b.start+':00'} ${b.title}`).join('\n');
     bot.sendMessage(user.telegram_id,
